@@ -11,6 +11,7 @@ Welcome to STalign's documentation!
    :glob:
    
    overview
+   how_it_works
    tutorials
    STalign
    CHANGES

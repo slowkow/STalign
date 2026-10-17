@@ -24,6 +24,8 @@ extensions = ['myst_parser', 'autodocsumm', 'nbsphinx',
 ]
 # anchors for the Markdown headings, so that links like README's #performance resolve
 myst_heading_anchors = 3
+# $...$ and $$...$$ math in the Markdown pages (how_it_works.md)
+myst_enable_extensions = ['dollarmath']
 source_suffix = ['.rst', '.md'
 ]
 
