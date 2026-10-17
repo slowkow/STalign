@@ -18,6 +18,12 @@ STalign enables:
 - alignment of ST datasets across technologies
 - alignment of ST datasets to a 3D common coordinate framework 
 
+## How it works
+
+STalign turns each set of cells into a density image, then finds an affine map and a smooth, invertible deformation that make the source image match the target, and moves the cells with them. [How STalign works](https://jef.works/STalign/how_it_works.html) explains each step, with its equations and figures.
+
+![Two sets of cells are rasterized into density images, the fitted map deforms the source image onto the target, and the source cells are moved onto the target.](docs/figures/overview.png)
+
 ## Installation
 
 ```
