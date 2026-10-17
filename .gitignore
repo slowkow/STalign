@@ -10,6 +10,7 @@ __pycache__/
 *~
 
 _build/
+docs/explorer/build/
 Pipfile.lock
 
 # build outputs (C++ extension, wheels, egg-info)

@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="An interactive walk through how STalign aligns tissue sections: rasterization, affine pre-fit, LDDMM regularization and the mixture model, on real MERFISH fits.">
+<title>Inside STalign</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] },
+    svg: { fontCache: 'global' },
+    options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js" async></script>
+<style>
+/* Layout: one long bench-and-notes walk through the pipeline. Each step pairs a text column
+   with a black "slide" panel (the overlays are fluorescence-style images), stacking on phones.
+   Magenta = target, green = source everywhere, as in the overlays. */
+:root {
+  --paper: #f2f4f7;
+  --paper-2: #e4e8ee;
+  --ink: #141820;
+  --ink-2: #4b5466;
+  --rule: #c9d0db;
+  --slide: #06070a;
+  --slide-ink: #e6eaf0;
+  --slide-ink-2: #9aa3b2;
+  --tgt: #b8259f;
+  --src: #18843f;
+  --accent: #2b55c9;
+  --warm: #b56a00;
+  --ok: #18843f;
+  --bad: #b42318;
+  --code-bg: #e9edf3;
+
+  --display: 'Archivo', 'Arial Narrow', 'Helvetica Neue', Arial, sans-serif;
+  --body: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  --s-1: 0.8125rem;
+  --s0: 1rem;
+  --s1: 1.1875rem;
+  --s2: 1.5rem;
+  --s3: 2.125rem;
+  --s4: clamp(2.4rem, 6vw, 4.25rem);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0e1116; --paper-2: #1a1f28; --ink: #e7ebf1; --ink-2: #9ba5b5; --rule: #2b323e;
+    --slide: #040508; --slide-ink: #e6eaf0; --slide-ink-2: #9aa3b2;
+    --tgt: #ee6fe0; --src: #50d985; --accent: #86a8ff; --warm: #f0b54a; --ok: #50d985; --bad: #ff8a80;
+    --code-bg: #161b23;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0e1116; --paper-2: #1a1f28; --ink: #e7ebf1; --ink-2: #9ba5b5; --rule: #2b323e;
+  --slide: #040508; --slide-ink: #e6eaf0; --slide-ink-2: #9aa3b2;
+  --tgt: #ee6fe0; --src: #50d985; --accent: #86a8ff; --warm: #f0b54a; --ok: #50d985; --bad: #ff8a80;
+  --code-bg: #161b23;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+img { max-width: 100%; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: var(--s0);
+  line-height: 1.6;
+  margin: 0;
+}
+.wrap {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.08; }
+h1 { font-size: var(--s4); font-weight: 800; font-stretch: 78%; letter-spacing: -0.01em; }
+h2 { font-size: var(--s3); font-weight: 750; font-stretch: 80%; }
+h3 { font-size: var(--s1); font-weight: 700; font-stretch: 88%; }
+p { margin: 0; }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible, button:focus-visible, input:focus-visible, label:focus-within {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+code, .mono { font-family: var(--mono); font-size: 0.9em; }
+code { background: var(--code-bg); padding: 0.05em 0.3em; border-radius: 3px; }
+.eyebrow {
+  font-family: var(--mono); font-size: var(--s-1); letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--ink-2);
+}
+.t { color: var(--tgt); font-weight: 600; }
+.s { color: var(--src); font-weight: 600; }
+.muted { color: var(--ink-2); }
+.stack { display: flex; flex-direction: column; gap: 1rem; }
+.prose { max-width: 64ch; display: flex; flex-direction: column; gap: 1rem; }
+.math { overflow-x: auto; overflow-y: hidden; padding: 0.25rem 0; }
+.math mjx-container[display="true"] { margin: 0.4em 0 !important; }
+
+/* ---------- docs bar ---------- */
+.docsbar { border-bottom: 1px solid var(--rule); font-family: var(--mono); font-size: var(--s-1); }
+.docsbar .wrap { display: flex; flex-wrap: wrap; gap: 0.3rem 1.25rem; padding-block: 0.6rem; align-items: baseline; }
+.docsbar a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--rule); }
+.docsbar a:hover { border-color: var(--ink); }
+.docsbar b { font-family: var(--display); font-stretch: 85%; font-size: var(--s0); margin-right: auto; }
+
+/* ---------- hero ---------- */
+header.hero { padding-block: 3rem 2.5rem; }
+.hero-grid { display: grid; gap: 2.5rem; grid-template-columns: minmax(0, 1fr); align-items: center; }
+@media (min-width: 900px) { .hero-grid { grid-template-columns: minmax(0, 6fr) minmax(0, 5fr); } }
+.hero .lede { font-size: var(--s1); line-height: 1.55; max-width: 34em; }
+.hero .who { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr); max-width: 40em; }
+@media (min-width: 640px) { .hero .who { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.who div { border-top: 2px solid var(--ink); padding-top: 0.6rem; }
+.who b { font-family: var(--display); font-stretch: 88%; font-size: var(--s1); display: block; }
+
+nav.steps { display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; font-family: var(--mono); font-size: var(--s-1); }
+nav.steps a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--rule); }
+nav.steps a:hover { border-color: var(--ink); }
+nav.steps span { color: var(--ink-2); }
+
+/* ---------- slide panels ---------- */
+.slide {
+  background: var(--slide); color: var(--slide-ink);
+  border-radius: 6px; padding: 0.9rem; display: flex; flex-direction: column; gap: 0.75rem;
+}
+.slide .cap { font-size: var(--s-1); color: var(--slide-ink-2); line-height: 1.45; }
+.slide .cap b { color: var(--slide-ink); font-weight: 600; }
+.frame { position: relative; width: 100%; max-width: 100%; aspect-ratio: 326 / 342; overflow: hidden; }
+.frame img, .frame canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.frame.px img { image-rendering: pixelated; }
+.frame .tag {
+  position: absolute; top: 0.5rem; left: 0.5rem; font-family: var(--mono); font-size: 0.72rem;
+  background: rgba(0, 0, 0, 0.6); color: #e6eaf0; padding: 0.1rem 0.4rem; border-radius: 3px;
+}
+.frame .tag.r { left: auto; right: 0.5rem; }
+.legend { display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; font-size: var(--s-1); color: var(--slide-ink-2); }
+.legend i { display: inline-block; width: 0.8em; height: 0.8em; border-radius: 2px; margin-right: 0.35em; vertical-align: -0.05em; }
+
+/* wipe */
+.wipe .after { clip-path: inset(0 0 0 var(--pos, 50%)); }
+.wipe .bar { position: absolute; top: 0; bottom: 0; left: var(--pos, 50%); width: 2px; background: #f0b54a; transform: translateX(-1px); pointer-events: none; }
+.wipe:focus-within { outline: 2px solid #f0b54a; outline-offset: 2px; }
+.wipe input[type=range] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: ew-resize; margin: 0; }
+
+/* ---------- step sections ---------- */
+section.step { padding-block: 3.5rem; border-top: 1px solid var(--rule); }
+.step-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 1rem; align-items: end; margin-bottom: 1.75rem; }
+.step-no {
+  font-family: var(--display); font-weight: 800; font-stretch: 62%; font-size: clamp(3.5rem, 9vw, 5.5rem);
+  line-height: 0.8; color: var(--ink); grid-row: span 2;
+}
+.step-grid { display: grid; gap: 2rem; grid-template-columns: minmax(0, 1fr); align-items: start; }
+@media (min-width: 960px) {
+  .step-grid { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 3rem; }
+  .bench-sticky { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 1rem); }
+}
+.panels { display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+@media (max-width: 520px) { .panels.can-stack { grid-template-columns: minmax(0, 1fr); } }
+
+/* controls */
+.controls { display: flex; flex-direction: column; gap: 0.7rem; }
+.ctl { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 0.6rem; align-items: center; }
+@media (max-width: 520px) { .ctl { grid-template-columns: minmax(0, 1fr); gap: 0.3rem; } }
+.ctl > .lab { font-family: var(--mono); font-size: 0.75rem; color: var(--slide-ink-2); letter-spacing: 0.04em; }
+.seg { display: flex; flex-wrap: wrap; gap: 0; border: 1px solid #3a414d; border-radius: 4px; overflow: hidden; width: fit-content; max-width: 100%; }
+.seg label { position: relative; cursor: pointer; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg span {
+  display: block; padding: 0.28rem 0.7rem; font-family: var(--mono); font-size: 0.8rem; color: var(--slide-ink-2);
+  border-right: 1px solid #3a414d; white-space: nowrap;
+}
+.seg label:last-child span { border-right: 0; }
+.seg input:checked + span { background: #e6eaf0; color: #06070a; }
+.seg label:hover span { color: var(--slide-ink); }
+.seg input:checked + span:hover { color: #06070a; }
+.seg span sup { font-size: 0.65em; }
+.range { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.range input { width: 100%; accent-color: #f0b54a; margin: 0; }
+.ticks { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 0.68rem; color: var(--slide-ink-2); }
+.ticks span { flex: 0 0 auto; text-align: center; min-width: 0; }
+.toggle { display: inline-flex; gap: 0.4rem; align-items: center; font-size: var(--s-1); color: var(--slide-ink-2); cursor: pointer; }
+.toggle input { accent-color: #f0b54a; }
+
+/* readouts */
+.readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: 0.6rem 1rem; }
+.readout div { display: flex; flex-direction: column; gap: 0.05rem; border-top: 1px solid #2b313b; padding-top: 0.35rem; min-width: 0; }
+.readout .k { font-size: 0.72rem; color: var(--slide-ink-2); line-height: 1.3; }
+.readout .v { font-family: var(--mono); font-size: 1.05rem; color: var(--slide-ink); font-variant-numeric: tabular-nums; }
+.chip { display: inline-block; font-family: var(--mono); font-size: 0.72rem; padding: 0.05rem 0.45rem; border-radius: 999px; vertical-align: 0.1em; }
+.chip.ok { background: #50d98522; color: #6be59a; border: 1px solid #50d98566; }
+.chip.bad { background: #ff8a8022; color: #ff9f97; border: 1px solid #ff8a8066; }
+
+/* charts (inside slide) */
+.chart svg { width: 100%; height: auto; display: block; }
+.chart text { font-family: var(--mono); font-size: 10px; fill: var(--slide-ink-2); }
+.chart .axis { stroke: #3a414d; stroke-width: 1; fill: none; }
+.chart .gridl { stroke: #20252e; stroke-width: 1; fill: none; }
+
+/* look closer notes */
+.look { border-left: 3px solid var(--warm); padding: 0.2rem 0 0.2rem 1rem; display: flex; flex-direction: column; gap: 0.6rem; }
+.look h3 { font-size: var(--s0); font-stretch: 95%; color: var(--warm); text-transform: uppercase; letter-spacing: 0.06em; }
+.look ul { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+
+/* tables */
+.tbl-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: var(--s-1); font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { font-family: var(--mono); font-weight: 500; font-size: 0.72rem; color: var(--ink-2); letter-spacing: 0.03em; }
+tr.sel td { background: var(--paper-2); font-weight: 600; }
+tbody tr[data-i] { cursor: pointer; }
+tbody tr[data-i]:hover td { background: var(--paper-2); }
+
+/* code */
+pre.code {
+  background: var(--code-bg); border-radius: 6px; padding: 0.9rem 1rem; margin: 0; overflow-x: auto;
+  font-family: var(--mono); font-size: 0.82rem; line-height: 1.55;
+}
+pre.code .c { color: var(--ink-2); }
+
+/* glossary */
+dl.gloss { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.9rem 2rem; margin: 0; }
+@media (min-width: 760px) { dl.gloss { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+dl.gloss div { display: flex; flex-direction: column; gap: 0.15rem; }
+dl.gloss dt { font-family: var(--display); font-weight: 700; font-stretch: 88%; font-size: var(--s1); }
+dl.gloss dd { margin: 0; color: var(--ink-2); }
+
+/* developer section */
+.arch { display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 1fr); }
+.arch .row { display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 760px) { .arch .row.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .arch .row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.box { border: 1px solid var(--rule); border-radius: 6px; padding: 0.8rem 0.9rem; display: flex; flex-direction: column; gap: 0.3rem; background: var(--paper); min-width: 0; }
+.box.main { border-color: var(--ink); border-width: 1.5px; }
+.box .f { font-family: var(--mono); font-size: 0.82rem; font-weight: 500; overflow-wrap: anywhere; }
+.box p { font-size: var(--s-1); color: var(--ink-2); line-height: 1.5; }
+.arrow { text-align: center; font-family: var(--mono); color: var(--ink-2); font-size: var(--s-1); line-height: 1; }
+ol.loop { margin: 0; padding-left: 1.4rem; display: flex; flex-direction: column; gap: 0.45rem; }
+ol.loop li::marker { font-family: var(--mono); color: var(--ink-2); }
+
+footer { padding-block: 2.5rem 3rem; border-top: 1px solid var(--rule); font-size: var(--s-1); color: var(--ink-2); }
+footer .wrap { display: flex; flex-direction: column; gap: 0.6rem; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .frame img.fade { transition: opacity 0.18s ease; }
+}
+</style>
+</head>
+<body>
+<div class="docsbar"><div class="wrap"><b>STalign explorer</b><a href="../index.html">STalign documentation</a><a href="../how_it_works.html">How STalign works</a><a href="../tutorials.html">Tutorials</a><a href="https://github.com/JEFworks-Lab/STalign">GitHub</a></div></div>
+
+
+<header class="hero">
+  <div class="wrap hero-grid">
+    <div class="stack" style="gap:1.4rem">
+      <div class="eyebrow">STalign 2.0 · how the alignment works</div>
+      <h1>Bend one tissue section onto another</h1>
+      <p class="lede">Two sections of the same organ never line up exactly. Each is cut, rotated, stretched and torn a little differently. STalign finds a smooth, invertible warp that carries the cells of one section (the <span class="s">source</span>) into the coordinates of another section or an atlas (the <span class="t">target</span>), so the same anatomy lands in the same place.</p>
+      <div class="who">
+        <div><b>New to image registration?</b> Read the steps in order and move the controls. Each picture was computed by STalign on the tutorial's MERFISH data.</div>
+        <div><b>Working on the code?</b> The equations match the implementation, and <a href="#code">Inside the code</a> maps them to the modules.</div>
+      </div>
+      <nav class="steps" aria-label="Steps">
+        <a href="#inout">In and out</a><a href="#raster"><span>1</span> Cells to images</a><a href="#prefit"><span>2</span> Affine pre-fit</a><a href="#lddmm"><span>3</span> LDDMM</a><a href="#mixture"><span>4</span> Missing tissue</a><a href="#cells"><span>5</span> Moving cells</a><a href="#code">Inside the code</a>
+      </nav>
+    </div>
+    <figure class="slide" style="margin:0">
+      <div class="frame wipe" id="wipe" style="--pos:50%">
+        <img src="assets/regularization/overlay_tutorial_affine.png" alt="Source and target cell densities overlaid at the rough starting position: large green and magenta regions where they disagree">
+        <img class="after" src="assets/regularization/sd0094/overlay_it2000.png" alt="The same overlay after STalign: mostly white where the sections agree">
+        <div class="bar"></div>
+        <span class="tag">start</span><span class="tag r">after STalign</span>
+        <input type="range" id="wipe-pos" min="0" max="100" value="50" aria-label="Compare start and result">
+      </div>
+      <div class="legend"><span><i style="background:#ff00ff"></i>target only</span><span><i style="background:#00ff00"></i>source only</span><span><i style="background:#fff"></i>both</span></div>
+      <figcaption class="cap">Two MERFISH sections of a mouse brain (slice 2, replicates 3 and 2, from the tutorial), drawn as cell density. <b>Drag across the image</b> to compare the tutorial's rough starting rotation with the fit STalign finds with its default settings (affine pre-fit, then 2,000 LDDMM iterations: 13 s on a desktop Mac).</figcaption>
+    </figure>
+  </div>
+</header>
+
+<main>
+<section class="step" id="inout">
+  <div class="wrap">
+    <div class="step-grid">
+      <div class="stack" style="gap:1.25rem">
+        <div class="eyebrow">Before the steps</div>
+        <h2>What goes in, what comes out</h2>
+        <div class="prose">
+          <p><b>In:</b> two sets of cells, each an array of <code>x</code> and <code>y</code> positions in µm. The target can also be a histology image, or a 3D atlas such as the Allen mouse brain (with <code>LDDMM_3D_to_slice</code>).</p>
+          <p><b>Out:</b> a transformation, not a list of matched cells. It has two parts: an affine map \(A\) (rotation, scaling, shear, shift) and a smooth deformation \(\varphi\). A source cell at \(x\) goes to</p>
+          <div class="math">\[ y = A\,\varphi(x). \]</div>
+          <p>\(\varphi\) is a <em>diffeomorphism</em>: smooth, with a smooth inverse. Tissue may stretch or compress, but it cannot fold over itself or tear. Because the result is a map of space, you can apply it to any points or images measured on the source section: cells, spots, annotations, gene expression images.</p>
+        </div>
+        <pre class="code"><span class="c"># xI, yI: source cells; xJ, yJ: target cells (µm)</span>
+from STalign import STalign
+import numpy as np
+
+out = STalign.align_cells(xI, yI, xJ, yJ)
+
+<span class="c"># move the source cells into target coordinates
+# (points are in row, column order: [y, x])</span>
+yx = STalign.transform_points_source_to_target(
+    out['xv'], out['v'], out['A'], np.stack([yI, xI], 1))
+yx = yx.cpu().numpy()</pre>
+        <p class="muted" style="font-size:var(--s-1)"><code>align_cells</code> runs steps 1 to 4 below with settings chosen for cells. The tutorials also show each step separately with <code>rasterize</code> and <code>LDDMM</code>, which is the way to learn what each setting does.</p>
+      </div>
+      <div class="stack" style="gap:1rem">
+        <div class="eyebrow">Words used on this page</div>
+        <dl class="gloss">
+          <div><dt>Source and target</dt><dd>The source is moved; the target stays put. Results are in target coordinates.</dd></div>
+          <div><dt>Raster</dt><dd>An image made from points: each pixel holds how many cells are nearby.</dd></div>
+          <div><dt>Affine map</dt><dd>\(x \mapsto Lx + T\): the same rotation, scaling and shear everywhere, plus a shift \(T\).</dd></div>
+          <div><dt>Velocity field \(v_t\)</dt><dd>An arrow at every point of a grid, saying which way space moves at time \(t\). Following the arrows gives \(\varphi\).</dd></div>
+          <div><dt>Energy</dt><dd>One number to minimize: how different the images still are, plus how rough the deformation is.</dd></div>
+          <div><dt>Regularization</dt><dd>The second part of the energy. It decides how much bending is allowed to make the images agree.</dd></div>
+          <div><dt>LDDMM</dt><dd>Large deformation diffeomorphic metric mapping: the method that finds \(A\) and \(v\) by gradient descent on the energy.</dd></div>
+          <div><dt>Overlay colors</dt><dd><span class="t">Magenta</span> where only the target has cells, <span class="s">green</span> where only the deformed source has them, white where both do.</dd></div>
+        </dl>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= STEP 1 ======================= -->
+<section class="step" id="raster">
+  <div class="wrap">
+    <div class="step-head"><div class="step-no">1</div><div class="eyebrow">rasterize</div><h2>Cells become images</h2></div>
+    <div class="step-grid">
+      <div class="stack" style="gap:1.25rem">
+        <div class="prose">
+          <p>LDDMM compares images, not lists of points, so each set of cells is first turned into a density image. Every cell adds a small Gaussian blob that sums to 1 over the pixels, so a pixel holds the number of cells near it:</p>
+          <div class="math">\[ I(x_k) = \sum_{i} \frac{\exp\!\big(-\lVert x_k - p_i\rVert^2 / 2s^2\big)}{\sum_{k'} \exp\!\big(-\lVert x_{k'} - p_i\rVert^2 / 2s^2\big)}, \]
+          \[ s = 2\cdot\texttt{blur}\cdot dx, \]</div>
+          <p>where \(p_i\) are the cell positions, \(x_k\) the pixel centers, \(dx\) the pixel size and <code>blur</code> the kernel width in pixels.</p>
+          <p>Smaller pixels keep detail but cost time: each LDDMM iteration touches every pixel, so 15 µm pixels take about 4 times the work of 30 µm pixels. Too much blur erases the layers and ventricles that guide the fit. Too little leaves the speckle of individual cells, which two different sections do not share.</p>
+        </div>
+        <div class="look">
+          <h3>Look closer</h3>
+          <ul>
+            <li><code>blur</code> is in pixels, so the same <code>blur</code> is twice as wide at twice the pixel size. Compare 15 µm and 60 µm at blur 2. <code>rasterize(..., blur_um=30)</code> sets the width in µm instead.</li>
+            <li>The tutorials use \(dx = 30\) µm and <code>blur=1.5</code>, a 90 µm kernel. <code>align_cells</code> uses 15 µm pixels and a 30 µm kernel and fits coarse to fine: first on images pooled 4×4, then 2×2.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="bench-sticky">
+        <div class="slide" id="ras-bench">
+          <div class="controls">
+            <div class="ctl"><span class="lab">pixel size dx</span>
+              <div class="seg" role="radiogroup" aria-label="Pixel size">
+                <label><input type="radio" name="ras-dx" id="ras-dx-15" value="15"><span>15 µm</span></label>
+                <label><input type="radio" name="ras-dx" id="ras-dx-30" value="30" checked><span>30 µm</span></label>
+                <label><input type="radio" name="ras-dx" id="ras-dx-60" value="60"><span>60 µm</span></label>
+              </div></div>
+            <div class="ctl"><span class="lab">blur (pixels)</span>
+              <div class="seg" role="radiogroup" aria-label="Blur">
+                <label><input type="radio" name="ras-blur" id="ras-blur-05" value="0.5"><span>0.5</span></label>
+                <label><input type="radio" name="ras-blur" id="ras-blur-1" value="1" checked><span>1</span></label>
+                <label><input type="radio" name="ras-blur" id="ras-blur-2" value="2"><span>2</span></label>
+              </div></div>
+          </div>
+          <div class="panels">
+            <div class="frame px" id="ras-full-frame">
+              <img id="ras-full" src="assets/rasterize/dx30_blur1.png" alt="Target section rasterized">
+              <canvas id="ras-box" aria-hidden="true"></canvas>
+              <span class="tag">whole section</span>
+            </div>
+            <div class="frame px" style="aspect-ratio:1/1">
+              <img id="ras-zoom" src="assets/rasterize/dx30_blur1_zoom.png" alt="A 1.5 mm window of the raster, enlarged">
+              <canvas id="ras-dots" aria-hidden="true"></canvas>
+              <span class="tag">1.5 × 1.5 mm</span>
+            </div>
+          </div>
+          <label class="toggle"><input type="checkbox" id="ras-show-cells" checked> show the cells (yellow dots) in the window</label>
+          <div class="readout">
+            <div><span class="k">kernel sd</span><span class="v" id="ras-sd">30 µm</span></div>
+            <div><span class="k">image size</span><span class="v" id="ras-shape">–</span></div>
+            <div><span class="k">peak density</span><span class="v" id="ras-peak">–</span></div>
+          </div>
+          <p class="cap">The target section, 84,172 cells. Gray level: cells per mm², same scale for all nine images (white = 3,350 or more). Pixels are drawn as squares.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= STEP 2 ======================= -->
+<section class="step" id="prefit">
+  <div class="wrap">
+    <div class="step-head"><div class="step-no">2</div><div class="eyebrow">prefit='auto'</div><h2>A rough affine fit first</h2></div>
+    <div class="step-grid">
+      <div class="stack" style="gap:1.25rem">
+        <div class="prose">
+          <p>LDDMM improves an alignment by gradient descent, so it finds the best fit <em>near</em> where it starts. If the source starts upside down, the nearest fit is a wrong one.</p>
+          <p>So before LDDMM, STalign runs a coarse affine pre-fit. It tries 12 starting rotations, 30° apart, fits only the affine map</p>
+          <div class="math">\[ A = \begin{pmatrix} L & T \\ 0 & 1 \end{pmatrix}, \qquad x \mapsto Lx + T \]</div>
+          <p>from each start on downsampled images, keeps the one with the lowest energy and refines it. In 3D it tries tilted and shifted slice planes instead. <code>prefit=False</code> turns it off, and it is skipped when you give landmarks.</p>
+          <p>To test it, we rotated the tutorial's source by a known angle and aligned it from there, with and without the pre-fit (1,000 iterations each). Since the rotation is known, a correct fit puts every cell where the fit of the unrotated source puts it. The error is that distance.</p>
+        </div>
+        <div class="look">
+          <h3>Look closer</h3>
+          <ul>
+            <li>Without the pre-fit, only the unrotated case succeeded (median error under 50 µm). At 5° the median error was already 59 µm, at 15° 325 µm, and from 30° on it was 0.9 to 5.8 mm. With the pre-fit, every angle from 0° to 180° had a median error of 2 to 4 µm.</li>
+            <li>A failed fit can look fine. At 15° and 30° without the pre-fit the overlay is nearly white, because the deformation bent tissue onto the wrong tissue until the outlines matched. Check alignments against anatomy you know, such as the ventricles and the hippocampus.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="bench-sticky">
+        <div class="slide">
+          <div class="controls">
+            <div class="ctl"><span class="lab">source rotated by</span>
+              <div class="range">
+                <input type="range" id="pf-angle" min="0" max="14" step="1" value="6" aria-label="Rotation of the source">
+                <div class="ticks" id="pf-ticks"></div>
+              </div></div>
+            <div class="ctl"><span class="lab">pre-fit</span>
+              <div class="seg" role="radiogroup" aria-label="Affine pre-fit">
+                <label><input type="radio" name="pf-on" id="pf-on-0" value="0"><span>off</span></label>
+                <label><input type="radio" name="pf-on" id="pf-on-1" value="1" checked><span>on (default)</span></label>
+              </div></div>
+          </div>
+          <div class="panels">
+            <div class="frame"><img id="pf-in" src="assets/prefit/theta060_input.png" alt="Starting position: rotated source over the target"><span class="tag">start</span></div>
+            <div class="frame"><img id="pf-out" src="assets/prefit/theta060_prefit1.png" alt="Result of the fit"><span class="tag" id="pf-out-tag">result</span></div>
+          </div>
+          <div class="readout">
+            <div><span class="k">rotation</span><span class="v" id="pf-deg">60°</span></div>
+            <div><span class="k">median error per cell</span><span class="v" id="pf-err">–</span></div>
+            <div><span class="k">verdict (median &lt; 50 µm)</span><span class="v" id="pf-verdict">–</span></div>
+          </div>
+          <div class="chart" id="pf-chart" aria-label="Median error against rotation angle, with and without the pre-fit"></div>
+          <p class="cap">Median error per cell against the starting rotation (log scale). <span style="color:#ff9f97">Off</span> and <span style="color:#86a8ff">on</span>; dashed line: 50 µm. Overlays are on the target's 30 µm grid.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= STEP 3 ======================= -->
+<section class="step" id="lddmm">
+  <div class="wrap">
+    <div class="step-head"><div class="step-no">3</div><div class="eyebrow">LDDMM</div><h2>A smooth flow of space</h2></div>
+    <div class="step-grid">
+      <div class="stack" style="gap:1.25rem">
+        <div class="prose">
+          <p>LDDMM does not move pixels one by one. It moves space along a velocity field \(v_t\), a smooth vector field on a grid, and following the flow for unit time gives the map:</p>
+          <div class="math">\[ \frac{d}{dt}\varphi_t(x) = v_t\big(\varphi_t(x)\big), \qquad \varphi_0(x) = x, \qquad \varphi = \varphi_1. \]</div>
+          <p>STalign takes \(n_t = 3\) time steps. Because each step is a small, smooth move, their composition is smooth and invertible. That is what keeps tissue from folding.</p>
+          <p>\(A\) and \(v\) are found together by minimizing one energy:</p>
+          <div class="math">\[ \begin{aligned} E(A, v) = {} & \underbrace{\frac{1}{2\sigma_M^2} \sum_{x} W_M(x)\,\Big[ f\big(I\circ\varphi^{-1}\circ A^{-1}\big)(x) - J(x) \Big]^2}_{E_M \text{: the images still differ}} \\ & + \underbrace{\frac{1}{2\sigma_R^2} \sum_{t} \big\lVert (1 - a^2\Delta)^{p}\, v_t \big\rVert^2}_{E_R \text{: the flow is rough}} \end{aligned} \]</div>
+          <p>\(I\) is the source image and \(J\) the target. \(I\circ\varphi^{-1}\circ A^{-1}\) is the deformed source, sampled on the target's pixels \(x\). \(f\) is a linear intensity map (an offset and a scale), refitted every iteration so the two images need not share units. \(W_M\) weighs each target pixel (step 4). The operator \((1 - a^2\Delta)^{p}\) penalizes velocity that changes over distances shorter than \(a\) (defaults \(a = 500\) µm, \(p = 2\)).</p>
+          <p>Each iteration takes one gradient step,</p>
+          <div class="math">\[ v \leftarrow v - \epsilon_V\, K * \nabla_{v} E, \]
+          \[ L \leftarrow L - \epsilon_L \nabla_L E, \qquad T \leftarrow T - \epsilon_T \nabla_T E, \]</div>
+          <p>where \(K = (1 - a^2\Delta)^{-2p}\) smooths the gradient. It is applied with FFTs. The step sizes \(\epsilon\) are scaled to the images and capped where gradient descent would become unstable.</p>
+          <p><b>The setting that matters most is \(\sigma_R\)</b>, the balance between the two terms. Since version 2.0 you choose <code>sigma_disp</code>, the typical displacement in µm that the deformation is expected to have (default 94 µm), and STalign converts it:</p>
+          <div class="math">\[ \sigma_R = \sigma_{\text{disp}}\,\sqrt{C_d\,\pi}\;a^{d/2}\,\sqrt{n_t}\;\frac{dx}{30\ \mu\text{m}}\;\frac{\sigma_M}{s_J}, \]</div>
+          <p>with \(C_2 = 12\), \(d\) the dimension and \(s_J\) the intensity scale of the target. The factor \(dx\) is there because \(E_M\) is a sum over pixels and \(E_R\) is not, so the same <code>sigma_disp</code> means the same thing at any pixel size. A <code>sigmaR</code> you pass is used as given.</p>
+        </div>
+        <div class="look">
+          <h3>Look closer</h3>
+          <ul>
+            <li>Iteration 0 already looks close: it is the end of the affine pre-fit. Everything after it is LDDMM, which adjusts \(A\) and bends the grid.</li>
+            <li>At iteration 50 the matching energy \(E_M\) jumps up. That is not a worse fit: it is when the pixel weights \(W_M\) are first re-estimated. They start at 0.5 and rise toward 1 where the images match, so the same mismatch counts for more.</li>
+            <li>No setting here folds the tissue. Too much flexibility shows up as stretching and compression instead: at <code>sigma_disp=1000</code> some regions shrink to 0.55 times their area and others grow to 2.4 times, for a small gain in image correlation (0.85 to 0.88). At 3 µm the fit stays almost affine. Image similarity alone cannot choose <code>sigma_disp</code>; the default was chosen on test problems with known, ground-truth deformations.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="bench-sticky">
+        <div class="slide">
+          <div class="controls">
+            <div class="ctl"><span class="lab">sigma_disp</span>
+              <div class="seg" role="radiogroup" aria-label="sigma_disp" id="rg-sd"></div></div>
+            <div class="ctl"><span class="lab">iteration</span>
+              <div class="range">
+                <input type="range" id="rg-it" min="0" max="5" step="1" value="5" aria-label="Iteration">
+                <div class="ticks"><span>0</span><span>25</span><span>100</span><span>400</span><span>1000</span><span>2000</span></div>
+              </div></div>
+          </div>
+          <div class="frame">
+            <img id="rg-img" src="assets/regularization/sd0094/overlay_it2000.png" alt="Overlay of the deformed source on the target">
+            <canvas id="rg-grid" aria-hidden="true"></canvas>
+            <span class="tag" id="rg-tag">σ_disp 94 µm · iteration 2000</span>
+          </div>
+          <label class="toggle"><input type="checkbox" id="rg-show-grid" checked> show a 500 µm grid drawn on the source, carried by the map</label>
+          <div class="readout">
+            <div><span class="k">non-affine displacement (mean)</span><span class="v" id="rg-nl">–</span></div>
+            <div><span class="k">local area change (1st–99th pct)</span><span class="v" id="rg-area">–</span></div>
+            <div><span class="k">image correlation</span><span class="v" id="rg-corr">–</span></div>
+            <div><span class="k">folded pixels</span><span class="v" id="rg-fold">–</span></div>
+          </div>
+          <div class="chart" id="rg-chart" aria-label="Energy against iteration"></div>
+          <p class="cap">Energy against iteration (square-root scale): <span style="color:#e6eaf0">E</span> = <span style="color:#86a8ff">E<sub>M</sub></span> + <span style="color:#f0b54a">E<sub>R</sub></span>. The vertical line marks the frame shown. Each fit: 2,000 iterations from the same pre-fit, C++ engine, 9 to 14 s.</p>
+        </div>
+      </div>
+    </div>
+    <div class="stack" style="margin-top:2rem; gap:0.6rem">
+      <h3>All six settings after 2,000 iterations</h3>
+      <div class="tbl-wrap">
+        <table id="rg-table">
+          <thead><tr><th>sigma_disp</th><th>σ_R (derived)</th><th>non-affine displacement</th><th>area change, 1st–99th pct</th><th>image correlation</th><th>E_R / E</th><th>folded</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" style="font-size:var(--s-1)">Click a row to show it above. Non-affine displacement: how far cells move beyond the best affine fit of the whole map. Area change: the Jacobian determinant of the map on tissue. Correlation is between the deformed source and the target images.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= STEP 4 ======================= -->
+<section class="step" id="mixture">
+  <div class="wrap">
+    <div class="step-head"><div class="step-no">4</div><div class="eyebrow">mixture='em'</div><h2>When the target is missing tissue</h2></div>
+    <div class="step-grid">
+      <div class="stack" style="gap:1.25rem">
+        <div class="prose">
+          <p>Real sections tear, fold or are trimmed differently, so the target may lack tissue that the source has. A fit that tries to match every pixel then squeezes the source to cover only what the target has.</p>
+          <p>The weights \(W_M\) in \(E_M\) handle this. STalign treats each target pixel as either <em>matching</em> the deformed source or <em>background</em> (optionally also <em>artifact</em>), and re-estimates the probabilities during the fit (an EM algorithm). With <code>mixture='em'</code>:</p>
+          <div class="math">\[ W_M(x) = \frac{\pi_M\,\mathcal{N}\big(J(x) \mid f(AI)(x),\, v_M\big)}{\pi_M\,\mathcal{N}\big(J(x) \mid f(AI)(x),\, v_M\big) + \pi_B\,\mathcal{N}\big(J(x) \mid \mu_B,\, v_B\big)} \]</div>
+          <p>The proportions \(\pi\) and the variance \(v_M\) of a good match are learned from the residuals, so a pixel that fits far worse than is typical moves to the background and stops pulling on the source.</p>
+          <p>To test it, we removed the 30% of target cells to the right of x = 6.24 mm and aligned the full source to the cut target.</p>
+        </div>
+        <div class="look">
+          <h3>Look closer</h3>
+          <ul>
+            <li>With <code>mixture=None</code> (the <code>LDDMM</code> default) the source is squeezed into the remaining tissue: only 1.4% of source cells end up past the cut, where about 30% belong, and cells on the kept tissue are off by 186 µm on average. With <code>'em'</code>, 27% hang over the cut, \(W_M\) falls to 0.42 on average over the cut-away region, and the error on kept tissue drops to 115 µm.</li>
+            <li>With <code>mixture=None</code> the weight image is plain white: \(W_M \approx 1\) everywhere. The older weights use fixed variances that never favor the background at these intensities (0 to 3.5 cells per pixel). That is the result, not a display error.</li>
+            <li><code>'em'</code> has a cost. On the intact target it moved cells by 31 µm on average (median 14 µm) relative to the plain fit, and in our tests it made targets of uneven cell density worse. So <code>LDDMM</code> keeps <code>mixture=None</code>, and <code>align_cells</code> uses <code>'em'</code>.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="bench-sticky">
+        <div class="slide">
+          <div class="controls">
+            <div class="ctl"><span class="lab">target</span>
+              <div class="seg" role="radiogroup" aria-label="Target">
+                <label><input type="radio" name="mx-t" id="mx-t-full" value="full"><span>intact</span></label>
+                <label><input type="radio" name="mx-t" id="mx-t-cropped" value="cropped" checked><span>cut at 6.24 mm</span></label>
+              </div></div>
+            <div class="ctl"><span class="lab">mixture</span>
+              <div class="seg" role="radiogroup" aria-label="Mixture">
+                <label><input type="radio" name="mx-m" id="mx-m-none" value="none" checked><span>None</span></label>
+                <label><input type="radio" name="mx-m" id="mx-m-em" value="em"><span>'em'</span></label>
+              </div></div>
+          </div>
+          <div class="panels can-stack">
+            <div class="frame">
+              <img id="mx-ov" src="assets/mixture/overlay_cropped_none.png" alt="Overlay of the fit">
+              <div id="mx-cut" style="position:absolute;top:0;bottom:0;width:0;border-left:1.5px dashed #f0b54a"></div>
+              <span class="tag">overlay</span>
+            </div>
+            <div class="frame">
+              <img id="mx-wm" src="assets/mixture/WM_cropped_none.png" alt="Weight W_M of each target pixel">
+              <span class="tag">weight W<sub>M</sub></span>
+            </div>
+          </div>
+          <div class="readout">
+            <div><span class="k">source cells past the cut (≈30% is right)</span><span class="v" id="mx-frac">–</span></div>
+            <div><span class="k">error on kept tissue (mean)</span><span class="v" id="mx-err">–</span></div>
+            <div><span class="k">W<sub>M</sub> over the cut-away region</span><span class="v" id="mx-wcut">–</span></div>
+          </div>
+          <p class="cap">Errors are against the fit to the intact target with <code>mixture=None</code>. Weight map: black = background, white = matching. Dashed line: the cut.</p>
+        </div>
+      </div>
+    </div>
+    <div class="stack" style="margin-top:2rem; gap:0.6rem">
+      <h3>The same test with <code>align_cells</code></h3>
+      <div class="tbl-wrap">
+        <table id="mx-table">
+          <thead><tr><th>target</th><th>mixture</th><th>error on kept tissue</th><th>source cells past the cut</th><th>time</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" style="font-size:var(--s-1)">Errors against <code>align_cells</code> on the intact target with <code>mixture=None</code>. Its coarse-to-fine fit squeezed the source much less, even without the mixture.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= STEP 5 ======================= -->
+<section class="step" id="cells">
+  <div class="wrap">
+    <div class="step-head"><div class="step-no">5</div><div class="eyebrow">transform_points_source_to_target</div><h2>Moving the cells</h2></div>
+    <div class="step-grid">
+      <div class="prose">
+        <p>The fit is stored as the affine matrix <code>A</code>, the velocity field <code>v</code> and its grid <code>xv</code>. The image term above uses the backward map: each of the \(n_t\) steps moves a point by \(x \leftarrow x - v_t(x)/n_t\). To send source cells forward, <code>transform_points_source_to_target</code> undoes those steps exactly, solving each one for the point that the backward step would bring back:</p>
+        <div class="math">\[ p_{t+1} = p_t + \tfrac{1}{n_t}\, v_t(p_{t+1}), \qquad y = A\,p_{n_t}. \]</div>
+        <p>So cells land exactly where the image fit says they should. Version 1 used a forward Euler step instead, which is not the exact inverse; <code>exact_inverse=False</code> still gives it.</p>
+      </div>
+      <div class="prose">
+        <p><code>transform_points_target_to_source</code> goes the other way, and <code>transform_image_source_to_target</code> and <code>transform_image_target_to_source</code> warp whole images, for example gene expression rasters or annotation masks.</p>
+        <p><code>LDDMM_3D_to_slice</code> does the same between a 3D atlas and a 2D section. There \(A\) is a 3D affine map that also chooses the slice plane, and the pre-fit tries tilted and shifted planes.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= CODE ======================= -->
+<section class="step" id="code">
+  <div class="wrap">
+    <div class="step-head"><div class="step-no" style="font-size:clamp(2.6rem,6vw,3.6rem)">{ }</div><div class="eyebrow">for developers</div><h2>Inside the code</h2></div>
+    <div class="step-grid">
+      <div class="stack" style="gap:1.25rem">
+        <div class="prose">
+          <p>The public functions live in <code>STalign/STalign.py</code>, with the same names and arguments as version 1. The work happens in private modules. Every LDDMM fit goes through the same front end and then through one of two engines that compute the same iteration.</p>
+        </div>
+        <div class="arch">
+          <div class="box main"><span class="f">STalign.py · _lddmm.py</span><p><code>LDDMM</code>, <code>LDDMM_3D_to_slice</code>, <code>rasterize</code>, <code>transform_*</code>, <code>align_cells</code>. Thin wrappers that check arguments and call the modules below.</p></div>
+          <div class="arrow">↓</div>
+          <div class="box main"><span class="f">_lddmm_common.py</span><p><code>prepare_problem</code> builds the velocity grid and the kernels \(L\), \(K\). <code>resolve_defaults</code> runs the pre-fit and fills in <code>sigmaR</code>, steps and <code>niter</code> (from <span class="mono">_prefit.py</span>). <code>run_lddmm</code> picks an engine and runs the iterations in segments of 100.</p></div>
+          <div class="arrow">↓ backend='auto'</div>
+          <div class="row two">
+            <div class="box"><span class="f">_lddmm_cpp.py → _cpp/</span><p>C++17 engine via pybind11. CPU, float64. One whole iteration in C++ on a <code>std::thread</code> pool with the GIL released; FFTs by the vendored pocketfft. Built by <span class="mono">setup.py</span> when a compiler is available.</p></div>
+            <div class="box"><span class="f">_lddmm_torch.py</span><p>Pure PyTorch engine for any device and dtype (GPU, float32), and the fallback when the C++ engine is missing. Same iteration, same results up to rounding.</p></div>
+          </div>
+          <div class="row three">
+            <div class="box"><span class="f">_raster.py</span><p>Exact rasterization as tiled matrix products of separable Gaussians (86,000 cells in 31 ms).</p></div>
+            <div class="box"><span class="f">_transforms.py</span><p>Point and image transforms, the exact inverse, and <code>analyze3Dalign</code>.</p></div>
+            <div class="box"><span class="f">_cells.py</span><p><code>align_cells</code>: re-rasterize at 15 µm, then LDDMM coarse to fine.</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="stack" style="gap:1.25rem">
+        <h3>One iteration</h3>
+        <ol class="loop">
+          <li>Pull the target's pixel grid back through \(A^{-1}\) and the \(n_t\) backward steps of the flow, \(x \leftarrow x - v_t(x)/n_t\).</li>
+          <li>Sample the source image there (bilinear): the deformed source \(AI\).</li>
+          <li>Fit the intensity map \(f\) by weighted least squares and form the residual \(f(AI) - J\).</li>
+          <li>Compute \(E_M\) and its gradient back through the sampling and the flow. The engines assemble these gradients directly instead of recording an autograd graph.</li>
+          <li>Smooth the velocity gradient with \(K\) in Fourier space and add the \(E_R\) term.</li>
+          <li>Step \(L\), \(T\) and \(v\).</li>
+          <li>Every 5 iterations, update the class means; from iteration 50, also the weights \(W_M\), \(W_A\), \(W_B\) (or the mixture EM, with <code>mixture='em'</code>).</li>
+        </ol>
+        <h3>Ground rules for changes</h3>
+        <div class="prose">
+          <p>Both engines are tested against a plain autograd implementation of the original iteration in <span class="mono">tests/reference.py</span>; gradients agree to within 1e-9. <code>legacy_defaults=True</code> reproduces the version 1 defaults bit for bit, and results do not depend on the number of threads. <code>STalign.backend_info()</code> says which engine is in use; <code>backend='torch'</code> forces the fallback.</p>
+          <p><span class="mono">CHANGES.md</span> lists every change since version 1 with its measured effect, and the tests run on Linux and macOS in CI.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Every number and picture on this page was computed with STalign 2.0.0 (commit b220827, C++ engine, 8 threads) on the MERFISH data of the tutorial <span class="mono">merfish-merfish-alignment.ipynb</span>. The source starts from the tutorial's rough rotation. <span class="mono">docs/explorer/run_all.sh</span> recomputes them.</p>
+    <p>Method: Clifton, Anant et al., <a href="https://www.nature.com/articles/s41467-023-43915-7">STalign: Alignment of spatial transcriptomics data using diffeomorphic metric mapping</a>, Nature Communications 2023. Code: <a href="https://github.com/JEFworks-Lab/STalign">github.com/JEFworks-Lab/STalign</a>. Tutorials: <a href="https://jef.works/STalign/tutorials.html">jef.works/STalign</a>.</p>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const fmt = (x, d = 0) => Number(x).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const radio = (name) => (document.querySelector(`input[name="${name}"]:checked`) || {}).value;
+  const pad3 = (n) => String(n).padStart(3, '0');
+  const pad4 = (n) => String(n).padStart(4, '0');
+  const asset = (p) => 'assets/' + p;  // manifest paths are relative to assets/
+
+  // ---------- hero wipe ----------
+  const wipe = $('wipe');
+  $('wipe-pos').addEventListener('input', (e) => wipe.style.setProperty('--pos', e.target.value + '%'));
+
+  // canvas sized to its box at device resolution
+  function fitCanvas(cv) {
+    const r = cv.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    return { ctx, w, h, dpr };
+  }
+  function svgEl(tag, attrs, parent) {
+    const el = document.createElementNS(SVGNS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+  }
+
+  // Data files in assets/data/ each assign one value to window.STALIGN_EXPLORER[name]
+  // (written by docs/explorer/package.py). Loading them as scripts works from file:// too,
+  // where fetch() of JSON is blocked.
+  const DATA = (window.STALIGN_EXPLORER = window.STALIGN_EXPLORER || {});
+  const pending = {};
+  function loadData(name) {
+    if (DATA[name]) return Promise.resolve(DATA[name]);
+    if (!pending[name]) {
+      pending[name] = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = `assets/data/${name}.js`;
+        s.onload = () => (DATA[name] ? resolve(DATA[name]) : reject(new Error(`${s.src} did not define ${name}`)));
+        s.onerror = () => { delete pending[name]; reject(new Error(`could not load ${s.src}`)); };
+        document.head.appendChild(s);
+      });
+    }
+    return pending[name];
+  }
+
+  loadData('manifest').then(init).catch((err) => console.error(err));
+
+  function init(M) {
+    initRaster(M.rasterize);
+    initPrefit(M.prefit);
+    initReg(M.regularization);
+    initMixture(M.mixture);
+  }
+
+  // ---------- 1. rasterize ----------
+  function initRaster(R) {
+    let zoomCells = null;
+    loadData('zoom_cells').then((d) => { zoomCells = d; draw(); }).catch((err) => console.error(err));
+    const find = (dx, blur) => R.images.find((im) => im.dx_um === dx && Math.abs(im.blur_px - blur) < 1e-9);
+    function draw() {
+      const dx = +radio('ras-dx'), blur = +radio('ras-blur');
+      const im = find(dx, blur);
+      if (!im) return;
+      $('ras-full').src = asset(im.png);
+      $('ras-zoom').src = asset(im.zoom_png);
+      $('ras-full-frame').style.aspectRatio = `${im.shape[1]} / ${im.shape[0]}`;
+      $('ras-sd').textContent = `${fmt(im.kernel_sd_um)} µm`;
+      $('ras-shape').textContent = `${im.shape[0]} × ${im.shape[1]} px`;
+      $('ras-peak').textContent = `${fmt(im.max_cells_per_mm2)} /mm²`;
+      requestAnimationFrame(() => { drawBox(im); drawDots(im); });
+    }
+    function drawBox(im) {
+      const { ctx, w, h, dpr } = fitCanvas($('ras-box'));
+      const [x0, x1, y0, y1] = im.extent_um, [zx0, zx1, zy0, zy1] = im.zoom_extent_um;
+      const px = (x) => (x - x0) / (x1 - x0) * w, py = (y) => (y1 - y) / (y1 - y0) * h;
+      ctx.strokeStyle = '#f0b54a'; ctx.lineWidth = 1.5 * dpr;
+      ctx.strokeRect(px(zx0), py(zy1), px(zx1) - px(zx0), py(zy0) - py(zy1));
+    }
+    function drawDots(im) {
+      const { ctx, w, h, dpr } = fitCanvas($('ras-dots'));
+      if (!zoomCells || !$('ras-show-cells').checked) return;
+      const [x0, x1, y0, y1] = im.zoom_extent_um;
+      ctx.fillStyle = 'rgba(255, 196, 64, 0.9)';
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)'; ctx.lineWidth = 0.6 * dpr;
+      const r = Math.max(1.1, w / 260) * 1.0;
+      for (let i = 0; i < zoomCells.x.length; i++) {
+        const X = (zoomCells.x[i] - x0) / (x1 - x0) * w, Y = (y1 - zoomCells.y[i]) / (y1 - y0) * h;
+        if (X < 0 || Y < 0 || X > w || Y > h) continue;
+        ctx.beginPath(); ctx.arc(X, Y, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+      }
+    }
+    document.querySelectorAll('input[name="ras-dx"], input[name="ras-blur"]').forEach((el) => el.addEventListener('change', draw));
+    $('ras-show-cells').addEventListener('change', draw);
+    window.addEventListener('resize', draw);
+    draw();
+  }
+
+  // ---------- 2. prefit ----------
+  function initPrefit(P) {
+    const angles = P.angles_deg;
+    const ticks = $('pf-ticks');
+    [0, 30, 60, 90, 120, 150, 180].forEach((a) => { const s = document.createElement('span'); s.textContent = a + '°'; ticks.appendChild(s); });
+    // the slider is linear in index; angles are not evenly spaced, so place ticks by index
+    ticks.style.position = 'relative'; ticks.style.height = '1.1em'; ticks.style.display = 'block';
+    [...ticks.children].forEach((s) => {
+      const a = parseInt(s.textContent, 10), i = angles.indexOf(a);
+      s.style.position = 'absolute'; s.style.left = `calc(${(i / (angles.length - 1)) * 100}% )`; s.style.transform = 'translateX(-50%)';
+      if (i === 0) s.style.transform = 'none';
+      if (i === angles.length - 1) s.style.transform = 'translateX(-100%)';
+    });
+    const res = (theta, on) => P.results.find((r) => r.theta_deg === theta && r.prefit === on);
+
+    // chart
+    const W = 420, H = 150, m = { l: 56, r: 14, t: 8, b: 24 };
+    const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' }, $('pf-chart'));
+    const lx = (a) => m.l + a / 180 * (W - m.l - m.r);
+    const lmin = 0, lmax = 4; // 1 µm .. 10 mm
+    const ly = (e) => { const v = Math.log10(Math.max(e, 1)); return m.t + (1 - (v - lmin) / (lmax - lmin)) * (H - m.t - m.b); };
+    [1, 10, 100, 1000, 10000].forEach((e) => {
+      svgEl('line', { x1: m.l, x2: W - m.r, y1: ly(e), y2: ly(e), class: 'gridl' }, svg);
+      const t = svgEl('text', { x: m.l - 6, y: ly(e) + 3, 'text-anchor': 'end' }, svg);
+      t.textContent = e >= 1000 ? (e / 1000) + ' mm' : e + ' µm';
+    });
+    [0, 30, 60, 90, 120, 150, 180].forEach((a) => {
+      const t = svgEl('text', { x: lx(a), y: H - 8, 'text-anchor': 'middle' }, svg); t.textContent = a + '°';
+    });
+    svgEl('line', { x1: m.l, x2: W - m.r, y1: ly(50), y2: ly(50), stroke: '#c9d0db', 'stroke-dasharray': '3 3', 'stroke-width': 1 }, svg);
+    const series = (on, color) => {
+      const pts = angles.map((a) => [lx(a), ly(res(a, on).error_um.median)]);
+      svgEl('polyline', { points: pts.map((p) => p.join(',')).join(' '), fill: 'none', stroke: color, 'stroke-width': 1.75 }, svg);
+      pts.forEach((p) => svgEl('circle', { cx: p[0], cy: p[1], r: 2.4, fill: color }, svg));
+    };
+    series(false, '#ff8a80');
+    series(true, '#86a8ff');
+    const cursor = svgEl('line', { y1: m.t, y2: H - m.b, stroke: '#f0b54a', 'stroke-width': 1.25 }, svg);
+    const dot = svgEl('circle', { r: 4.5, fill: 'none', stroke: '#f0b54a', 'stroke-width': 1.5 }, svg);
+
+    function draw() {
+      const a = angles[+$('pf-angle').value];
+      const on = radio('pf-on') === '1';
+      const r = res(a, on);
+      $('pf-in').src = asset(r.input_overlay);
+      $('pf-out').src = asset(r.overlay);
+      $('pf-out-tag').textContent = on ? 'result, pre-fit on' : 'result, pre-fit off';
+      $('pf-deg').textContent = a + '°';
+      const e = r.error_um.median;
+      $('pf-err').textContent = e >= 1000 ? `${fmt(e / 1000, 2)} mm` : `${fmt(e, e < 10 ? 1 : 0)} µm`;
+      $('pf-verdict').innerHTML = r.success ? '<span class="chip ok">correct</span>' : '<span class="chip bad">wrong</span>';
+      cursor.setAttribute('x1', lx(a)); cursor.setAttribute('x2', lx(a));
+      dot.setAttribute('cx', lx(a)); dot.setAttribute('cy', ly(e));
+    }
+    $('pf-angle').addEventListener('input', draw);
+    document.querySelectorAll('input[name="pf-on"]').forEach((el) => el.addEventListener('change', draw));
+    draw();
+  }
+
+  // ---------- 3. LDDMM / regularization ----------
+  function initReg(G) {
+    const runs = G.runs, frames = G.frames;
+    const ext = G.extent_um;
+    const cache = {};
+    let sdIndex = runs.findIndex((r) => Math.abs(r.sigma_disp - 94.03) < 1e-6);
+    if (sdIndex < 0) sdIndex = 0;
+
+    const seg = $('rg-sd');
+    runs.forEach((r, i) => {
+      const lab = document.createElement('label');
+      const isDef = Math.abs(r.sigma_disp - 94.03) < 1e-6;
+      lab.innerHTML = `<input type="radio" name="rg-sd" id="rg-sd-${r.tag}" value="${i}"${i === sdIndex ? ' checked' : ''}><span>${isDef ? '94*' : fmt(r.sigma_disp)}</span>`;
+      seg.appendChild(lab);
+    });
+    seg.title = 'µm; * = default (94.03 µm)';
+
+    // table
+    const tb = document.querySelector('#rg-table tbody');
+    runs.forEach((r, i) => {
+      const f = r.frames[r.frames.length - 1];
+      const tr = document.createElement('tr');
+      tr.dataset.i = i;
+      const isDef = Math.abs(r.sigma_disp - 94.03) < 1e-6;
+      tr.innerHTML = `<td>${isDef ? '94.03 µm (default)' : fmt(r.sigma_disp) + ' µm'}</td><td>${fmt(r.settings.sigmaR)}</td>` +
+        `<td>${fmt(f.nonaffine_residual_um.mean, 1)} µm</td><td>${fmt(f.area_ratio_p01, 2)}–${fmt(f.area_ratio_p99, 2)}×</td>` +
+        `<td>${fmt(f.image_corr, 3)}</td><td>${fmt(100 * f.ER / f.E, 0)}%</td><td>${fmt(100 * f.folded_fraction, 0)}%</td>`;
+      tr.addEventListener('click', () => { $('rg-sd-' + r.tag).checked = true; sdIndex = i; draw(); });
+      tb.appendChild(tr);
+    });
+
+    function load(run) {
+      if (!cache[run.tag]) {
+        cache[run.tag] = loadData(run.tag);  // {grid, energy}
+      }
+      return cache[run.tag];
+    }
+
+    // energy chart scaffold
+    const W = 420, H = 160, m = { l: 44, r: 18, t: 10, b: 24 };
+    const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' }, $('rg-chart'));
+    const sx = (it) => m.l + Math.sqrt(it / 2000) * (W - m.l - m.r);
+    const gAxes = svgEl('g', {}, svg);
+    const pE = svgEl('path', { fill: 'none', stroke: '#e6eaf0', 'stroke-width': 1.6 }, svg);
+    const pM = svgEl('path', { fill: 'none', stroke: '#86a8ff', 'stroke-width': 1.3 }, svg);
+    const pR = svgEl('path', { fill: 'none', stroke: '#f0b54a', 'stroke-width': 1.3 }, svg);
+    const cursor = svgEl('line', { y1: m.t, y2: H - m.b, stroke: '#f0b54a', 'stroke-width': 1, 'stroke-dasharray': '2 2' }, svg);
+    frames.forEach((f) => { const t = svgEl('text', { x: sx(f), y: H - 8, 'text-anchor': 'middle' }, svg); t.textContent = f; });
+
+    function niceMax(v) {
+      const p = Math.pow(10, Math.floor(Math.log10(v)));
+      for (const k of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (k * p >= v) return k * p;
+      return 10 * p;
+    }
+
+    function drawEnergy(energy, it) {
+      const its = energy.iteration, E = energy.E, EM = energy.EM, ER = energy.ER;
+      let ymax = 0; for (const v of E) if (v > ymax) ymax = v;
+      ymax = niceMax(ymax);
+      const sy = (v) => m.t + (1 - v / ymax) * (H - m.t - m.b);
+      gAxes.innerHTML = '';
+      for (let k = 0; k <= 4; k++) {
+        const v = ymax * k / 4;
+        svgEl('line', { x1: m.l, x2: W - m.r, y1: sy(v), y2: sy(v), class: 'gridl' }, gAxes);
+        const t = svgEl('text', { x: m.l - 6, y: sy(v) + 3, 'text-anchor': 'end' }, gAxes); t.textContent = fmt(v);
+      }
+      const path = (arr) => { let d = ''; for (let i = 0; i < arr.length; i++) d += (i ? 'L' : 'M') + sx(its[i]).toFixed(1) + ',' + sy(arr[i]).toFixed(1); return d; };
+      pE.setAttribute('d', path(E)); pM.setAttribute('d', path(EM)); pR.setAttribute('d', path(ER));
+      cursor.setAttribute('x1', sx(it)); cursor.setAttribute('x2', sx(it));
+    }
+
+    function drawGrid(grid, it) {
+      const { ctx, w, h, dpr } = fitCanvas($('rg-grid'));
+      if (!$('rg-show-grid').checked) return;
+      const lines = grid.lines[String(it)];
+      if (!lines) return;
+      const px = (x) => (x - ext[0]) / (ext[1] - ext[0]) * w, py = (y) => (ext[3] - y) / (ext[3] - ext[2]) * h;
+      ctx.strokeStyle = 'rgba(255, 200, 80, 0.75)'; ctx.lineWidth = 0.9 * dpr;
+      for (const L of lines) {
+        ctx.beginPath();
+        for (let i = 0; i < L.length; i += 2) {
+          const X = px(L[i]), Y = py(L[i + 1]);
+          if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+        }
+        ctx.stroke();
+      }
+    }
+
+    let token = 0;
+    function draw() {
+      const run = runs[sdIndex];
+      const fi = +$('rg-it').value, it = frames[fi];
+      const f = run.frames[fi];
+      $('rg-img').src = `assets/regularization/${run.tag}/overlay_it${pad4(it)}.png`;
+      const isDef = Math.abs(run.sigma_disp - 94.03) < 1e-6;
+      $('rg-tag').textContent = `σ_disp ${isDef ? '94' : fmt(run.sigma_disp)} µm · iteration ${it}`;
+      $('rg-nl').textContent = `${fmt(f.nonaffine_residual_um.mean, 1)} µm`;
+      $('rg-area').textContent = `${fmt(f.area_ratio_p01, 2)}–${fmt(f.area_ratio_p99, 2)}×`;
+      $('rg-corr').textContent = fmt(f.image_corr, 3);
+      $('rg-fold').textContent = `${fmt(100 * f.folded_fraction, 0)}%`;
+      document.querySelectorAll('#rg-table tbody tr').forEach((tr) => tr.classList.toggle('sel', +tr.dataset.i === sdIndex));
+      const my = ++token;
+      load(run).then(({ grid, energy }) => {
+        if (my !== token) return;
+        drawGrid(grid, it);
+        drawEnergy(energy, it);
+      }).catch((e) => console.error(e));
+    }
+    seg.addEventListener('change', (e) => { sdIndex = +e.target.value; draw(); });
+    $('rg-it').addEventListener('input', draw);
+    $('rg-show-grid').addEventListener('change', draw);
+    window.addEventListener('resize', draw);
+    draw();
+  }
+
+  // ---------- 4. mixture ----------
+  function initMixture(X) {
+    const ext = X.extent_um;
+    const cutPct = (X.crop.x_cut_um - ext[0]) / (ext[1] - ext[0]) * 100;
+    $('mx-cut').style.left = cutPct + '%';
+    const find = (t, mx) => X.results.find((r) => r.target === t && (r.mixture || 'none') === mx);
+    function draw() {
+      const t = radio('mx-t'), mx = radio('mx-m');
+      const r = find(t, mx);
+      $('mx-ov').src = asset(r.overlay);
+      $('mx-wm').src = asset(r.WM);
+      $('mx-cut').hidden = t !== 'cropped';
+      $('mx-frac').textContent = `${fmt(100 * r.fraction_of_source_cells_mapped_into_cropped_region, 1)}%`;
+      const isRef = t === 'full' && mx === 'none';
+      $('mx-err').textContent = isRef ? 'reference' : `${fmt(r.error_vs_full_reference_um.kept_region_mean, 0)} µm`;
+      $('mx-wcut').textContent = fmt(r.WM_mean_on_cropped_tissue, 2);
+    }
+    document.querySelectorAll('input[name="mx-t"], input[name="mx-m"]').forEach((el) => el.addEventListener('change', draw));
+    draw();
+
+    const tb = document.querySelector('#mx-table tbody');
+    X.align_cells.forEach((r) => {
+      const tr = document.createElement('tr');
+      const isRef = r.target === 'full' && !r.mixture;
+      tr.innerHTML = `<td>${r.target === 'full' ? 'intact' : 'cut at 6.24 mm'}</td><td>${r.mixture ? "'em'" : 'None'}</td>` +
+        `<td>${isRef ? 'reference' : fmt(r.kept_region_mean_error_um, 0) + ' µm'}</td>` +
+        `<td>${fmt(100 * r.fraction_of_source_cells_mapped_into_cropped_region, 1)}%</td><td>${fmt(r.seconds, 1)} s</td>`;
+      tb.appendChild(tr);
+    });
+  }
+})();
+</script>
+</body>
+</html>
