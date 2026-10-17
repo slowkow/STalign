@@ -775,7 +775,7 @@ def fig_maps(d):
     arrow_between(fig, ax3, ax4, text='cells:\nforward map')
     scalebar(ax, loc=(0.04, 0.03))
 
-    # round trip |b(f(x)) - x| over all source cells, exact inverse vs forward Euler
+    # round trip (forward map, then backward map) over all source cells, exact inverse vs forward Euler
     h = fig.add_subplot(gs[:, 2])
     allP = d.cells_I()
     floor = 1e-12
@@ -790,7 +790,7 @@ def fig_maps(d):
         print(f'  round trip, exact_inverse={exact}: median {np.median(e):.3g} um, max {e.max():.3g} um')
     h.set_xscale('log')
     h.set_xticks([1e-12, 1e-9, 1e-6, 1e-3, 1, 1e3])
-    h.set_xlabel(r'round-trip error $|b(f(x)) - x|$ (µm)')
+    h.set_xlabel(r'distance after mapping forward and back (µm)')
     h.set_ylabel('source cells')
     h.set_ylim(0, h.get_ylim()[1] * 1.35)
     h.legend(frameon=False, loc='upper center', fontsize=7.5)
