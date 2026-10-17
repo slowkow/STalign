@@ -14,6 +14,11 @@ mouse brain (slice 2, replicate 3; the *source*, always blue) are aligned to the
 neighbouring replicate (slice 2, replicate 2; the *target*, always vermillion). The script
 `docs/figures/make_figures.py` draws them with STalign's own functions; run it to reproduce them.
 
+To try the steps yourself, open the <a href="explorer/index.html">STalign explorer</a>, an
+interactive page with the same data: change the pixel size and blur, rotate the source with and
+without the affine pre-fit, step through a fit for six regularization strengths, and cut tissue
+from the target to see what the mixture model does.
+
 ```{figure} figures/overview.png
 :alt: Four panels: two overlapping cell clouds; their density images; the deformed source image with a curved grid; the aligned cells.
 :width: 100%

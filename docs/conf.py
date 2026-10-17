@@ -34,7 +34,7 @@ autodoc_default_options = {
 }
 
 templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', '_extra', 'explorer']
 
 
 
@@ -43,5 +43,7 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 
 html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
+# copied as is into the site: _extra/explorer/ becomes explorer/ (the interactive explorer)
+html_extra_path = ['_extra']
 html_logo = 'https://raw.githubusercontent.com/JEFworks-Lab/STalign/main/STalign_logos_fin.png'
 
